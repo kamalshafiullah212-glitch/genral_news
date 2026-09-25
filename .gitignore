@@ -1,0 +1,8 @@
+# local secrets & runtime state — never commit
+state/
+*.pyc
+__pycache__/
+.env
+_probe_sources.py
+probe_results.txt
+_*.txt

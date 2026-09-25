@@ -1,0 +1,51 @@
+name: General News Bot — Technology & Economy
+
+# Frequency is configured here — change the cron to adjust posting rate.
+# Examples:
+#   every 30 minutes:  */30 * * * *
+#   every hour:        0 * * * *
+#   every 2 hours:     0 */2 * * *
+# NOTE: GitHub may delay scheduled workflows by a few minutes.
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: general-news-bot
+  cancel-in-progress: false
+
+jobs:
+  post-news:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Restore duplicate-protection state
+        uses: actions/cache@v4
+        with:
+          path: state/posted.json
+          key: newsbot-state-${{ github.run_id }}
+          restore-keys: |
+            newsbot-state-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run news bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MAX_POSTS_PER_RUN: "4"
+          MAX_AGE_HOURS: "36"
+        run: python bot.py
