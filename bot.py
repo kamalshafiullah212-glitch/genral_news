@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-General News Bot — Technology & Economy (جنرل نیوز بوټ — ټکنالوژۍ او اقتصاد)
+Sequential Pashto news bot — Technology, Economy, Rates, Jobs & Social Media.
 
-One bot, all subjects except AI news:
-    Technology / Mobile / Social / Big Tech / Security / Internet / Gaming /
-    Tech Jobs / Afghanistan Tech  +  Economy / Forex / Markets / Crypto
+The bot publishes exactly one post per run in a fixed rotation:
 
-Pipeline:
-    RSS/News Sources -> Collection -> AI-News Filter -> Duplicate Removal
-    -> Category Detection -> Priority -> Pashto Summary -> Telegram
+    economy -> date -> rates -> afghan_tech -> jobs -> global_tech -> social
+
+* economy: only USD High-impact events from the Forex Factory calendar.
+* date: the daily date in Asia/Kabul, Gregorian + Solar Hijri.
+* rates: USD/EUR/GBP/PKR/IRR against AFN from ExchangeRate-API with timestamp.
+* afghan_tech / jobs / global_tech / social: category-specific RSS filters.
+* Optional Grok writing (GROK_API_KEY) for natural Pashto summaries; a safe
+  fallback is used when the key is missing or the API fails.
 
 Notes:
-  * AI news (ChatGPT, Gemini, Claude, OpenAI, ...) is NEVER posted here —
-    a separate AI News Bot handles that topic.
-  * Secrets (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID) come only from
-    environment variables (GitHub Secrets in CI). Nothing is hard-coded.
-  * Dry-run: set DRY_RUN=1 to print posts instead of sending them.
+  * Secrets come only from environment variables (GitHub Secrets in CI).
+  * Dry-run: set DRY_RUN=1 to print the post instead of sending it.
 """
 
 from __future__ import annotations
@@ -29,8 +29,10 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import feedparser
 import requests
@@ -51,15 +53,23 @@ CONFIG = {
     "token": os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
     "chat_id": os.environ.get("TELEGRAM_CHAT_ID", "").strip(),
     "dry_run": os.environ.get("DRY_RUN", "0").strip() in ("1", "true", "yes"),
-    "max_posts_per_run": env_int("MAX_POSTS_PER_RUN", 3),
+    "max_posts_per_run": 1,
     "max_age_hours": env_int("MAX_AGE_HOURS", 36),
     "min_score": env_int("MIN_SCORE", 50),
     "state_file": os.environ.get("STATE_FILE", "state/posted.json").strip(),
     "fetch_timeout": env_int("FETCH_TIMEOUT", 20),
-    "request_delay": 0.5,  # politeness delay between feed fetches
+    "request_delay": 0.35,
+    "grok_api_key": os.environ.get("GROK_API_KEY", "").strip(),
+    "grok_model": os.environ.get("GROK_MODEL", "grok-4.1-fast").strip(),
 }
 
 log = logging.getLogger("newsbot")
+
+HTTP_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (compatible; GeneralNewsBot/2.0; "
+                   "+https://github.com/kamalshafiullah212-glitch/genral_news)"),
+    "Accept": "application/rss+xml, application/atom+xml, application/json, text/xml, */*",
+}
 
 # ---------------------------------------------------------------------------
 # News sources (verified live; tier: 3 = official newsroom, 2 = tech press,
@@ -130,6 +140,56 @@ AI_STRONG = [
     "ai system", "ai systems", "chatbot",
 ]
 AI_STANDALONE = re.compile(r"\bAI\b")
+# Sequential publication order. Every successful run publishes one category only.
+ROTATION = ["economy", "date", "rates", "afghan_tech", "jobs", "global_tech", "social"]
+CATEGORY_META = {
+    "economy": ("💵", "اقتصاد", ["#Economy", "#USD_High_Impact"]),
+    "date": ("📅", "ورځنی تاریخ", ["#Date"]),
+    "rates": ("💱", "د افغانۍ نرخونه", ["#AFN", "#ExchangeRates"]),
+    "afghan_tech": ("🇦🇫", "د افغانستان ټیکنالوجي", ["#Technology", "#Afghanistan"]),
+    "jobs": ("💼", "د افغانستان دندې", ["#Jobs", "#Afghanistan"]),
+    "global_tech": ("🌍", "نړیوال ټیکنالوجي", ["#Technology"]),
+    "social": ("📱", "ټولنیزې رسانې", ["#SocialMedia"]),
+}
+FOREX_FACTORY_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+EXCHANGE_RATE_URL = "https://open.er-api.com/v6/latest/USD"
+FOREX_FACTORY_LINK = "https://www.forexfactory.com/calendar"
+EXCHANGE_RATE_LINK = "https://www.exchangerate-api.com"
+AFGHAN_TZ = ZoneInfo("Asia/Kabul")
+
+CATEGORY_SOURCES = {
+    "afghan_tech": [
+        ("Google News — Afghanistan Tech", 2,
+         "https://news.google.com/rss/search?q=Afghanistan+(internet+OR+telecom+OR+software+OR+startup+OR+technology)&hl=en-US&gl=US&ceid=US:en"),
+    ],
+    "jobs": [
+        ("ReliefWeb Jobs — Afghanistan", 3,
+         "https://reliefweb.int/jobs/rss.xml?advanced-search=%28C13%29"),
+        ("Google News — Afghanistan Jobs", 2,
+         "https://news.google.com/rss/search?q=(job+OR+vacancy+OR+%22job+opening%22)+Afghanistan+apply&hl=en-US&gl=US&ceid=US:en"),
+    ],
+    "global_tech": [
+        ("The Verge", 2, "https://www.theverge.com/rss/index.xml"),
+        ("TechCrunch", 2, "https://techcrunch.com/feed/"),
+        ("Ars Technica", 2, "https://feeds.arstechnica.com/arstechnica/index"),
+        ("NVIDIA Blog", 3, "https://blogs.nvidia.com/feed/"),
+        ("Google News — Global Technology", 2,
+         "https://news.google.com/rss/search?q=(AI+OR+software+OR+cybersecurity+OR+robotics+OR+smartphone+OR+internet)&hl=en-US&gl=US&ceid=US:en"),
+    ],
+    "social": [
+        ("Google News — Social Platforms", 2,
+         "https://news.google.com/rss/search?q=(Facebook+OR+Instagram+OR+TikTok+OR+YouTube+OR+Telegram+OR+WhatsApp+OR+Snapchat+OR+LinkedIn+OR+X)+(%22privacy%22+OR+security+OR+update+OR+feature+OR+policy)&hl=en-US&gl=US&ceid=US:en"),
+    ],
+}
+
+AFGHAN_WORDS = ("afghanistan", "afghan", "kabul", "herat", "kandahar", "mazar", "balkh", "roshan")
+JOB_WORDS = ("job", "jobs", "vacancy", "vacancies", "employment", "hiring", "recruitment", "tender", "career", "careers", "internship", "position", "manager", "officer", "coordinator", "director", "specialist", "consultant", "advisor", "assistant", "technician", "supervisor", "trainer", "engineer", "developer", "analyst", "nurse", "doctor", "midwife", "intern")
+SOCIAL_WORDS = ("facebook", "instagram", "tiktok", "youtube", "telegram", "whatsapp", "snapchat", "linkedin", "twitter", "social media", "social platform", "threads", "reels", "shorts")
+TECH_WORDS = ("technology", "tech", "internet", "telecom", "software", "app", "apps", "cybersecurity", "cyber security", "vulnerability", "malware", "ransomware", "smartphone", "iphone", "android", "computer", "laptop", "robot", "robotics", "chip", "semiconductor", "quantum", " ai ", "artificial intelligence", "machine learning", "openai", "chatgpt", "gemini", "claude", "llama", "grok", "microsoft", "apple", "google", "nvidia", "intel", "samsung", "developer", "data center", "broadband", "digital")
+UPDATE_WORDS = ("launch", "release", "update", "feature", "policy", "security", "privacy", "outage", "breach", "ban", "block", "remove", "launches", "rollout", "partnership", "acquire", "lawsuit", "regulation", "reform", "new", "release")
+
+# Sequential publisher uses CATEGORY_SOURCES above; the legacy SOURCES list is
+# kept below for compatibility with the original collector.
 
 # ---------------------------------------------------------------------------
 # Categories (keywords matched on title + summary, lower-cased)
@@ -903,7 +963,702 @@ def main() -> int:
     return 0 if stats["send_errors"] == 0 else 1
 
 
+# ---------------------------------------------------------------------------
+# Sequential rotation pipeline (one post per run, fixed category order)
+# ---------------------------------------------------------------------------
+BROKEN_ENDINGS = {
+    "a", "an", "and", "as", "at", "but", "by", "for", "from", "in", "into",
+    "is", "are", "was", "were", "be", "been", "being", "has", "have", "had",
+    "he", "her", "his", "how", "if", "its", "may", "might", "of", "on", "or",
+    "our", "over", "so", "than", "that", "the", "their", "then", "these",
+    "they", "this", "those", "to", "under", "up", "via", "will", "with",
+    "would", "you", "your", "vs", "new",
+}
+WEEKDAYS_PS = ["دوشنبه", "سه‌شنبه", "چهارشنبه", "پنجشنبه", "جمعه", "شنبه", "یکشنبه"]
+JALALI_MONTHS_PS = [
+    "حمل", "ثور", "جوزا", "سرطان", "اسد", "سنبله",
+    "میزان", "عقرب", "قوس", "جدي", "دلو", "حوت",
+]
+
+
+def _parse_dt(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, (int, float)):
+        dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
+    else:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        dt = None
+        for candidate in (raw, raw.replace("Z", "+00:00")):
+            try:
+                dt = datetime.fromisoformat(candidate)
+                break
+            except ValueError:
+                continue
+        if dt is None:
+            try:
+                dt = parsedate_to_datetime(raw)
+            except (TypeError, ValueError, IndexError):
+                return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _parse_published(entry: Any) -> Optional[datetime]:
+    for key in ("published_parsed", "updated_parsed", "created_parsed"):
+        tt = entry.get(key)
+        if tt:
+            try:
+                return datetime(*tt[:6], tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                pass
+    for key in ("published", "updated", "created", "dc_date"):
+        dt = _parse_dt(entry.get(key))
+        if dt:
+            return dt
+    return None
+
+
+def _has_any(text: str, words: tuple) -> bool:
+    low = " " + (text or "").lower() + " "
+    return any((" " + word.strip().lower() + " ") in low for word in words if word.strip())
+
+
+def _clean_spaces(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip()
+
+
+def _title_ok(title: str) -> bool:
+    if not (15 <= len(title) <= 300):
+        return False
+    if not re.search(r"[A-Za-z]", title):
+        return False
+    if LISTICLE_PATTERN.search(title):
+        return False
+    low = title.lower()
+    if any(re.search(pattern, low) for pattern in CLICKBAIT_PATTERNS):
+        return False
+    words = re.findall(r"[A-Za-z0-9']+", title)
+    if len(words) < 4:
+        return False
+    if words[-1].lower() in BROKEN_ENDINGS:
+        return False
+    if title.rstrip().endswith((":", ",", ";", "-", "–", "—")):
+        return False
+    return True
+
+
+def gregorian_to_jalali(gy: int, gm: int, gd: int) -> Tuple[int, int, int]:
+    """Convert a Gregorian date to the Solar Hijri (Jalali) calendar."""
+    month_days = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+    gy2 = gy - 1600
+    gm2 = gm - 1
+    gd2 = gd - 1
+    day_no = (365 * gy2) + ((gy2 + 3) // 4) - ((gy2 + 99) // 100) + ((gy2 + 399) // 400)
+    day_no += month_days[gm2] + gd2
+    if gm > 2 and ((gy % 4 == 0 and gy % 100 != 0) or gy % 400 == 0):
+        day_no += 1
+    j_day_no = day_no - 79
+    j_np = j_day_no // 12053
+    j_day_no %= 12053
+    jy = 979 + 33 * j_np + 4 * (j_day_no // 1461)
+    j_day_no %= 1461
+    if j_day_no >= 366:
+        jy += (j_day_no - 1) // 365
+        j_day_no = (j_day_no - 1) % 365
+    for month in range(11):
+        month_len = 31 if month < 6 else 30
+        if j_day_no < month_len:
+            return jy, month + 1, j_day_no + 1
+        j_day_no -= month_len
+    return jy, 12, j_day_no + 1
+
+
+class RotationState:
+    """Persistent duplicate + rotation state (migrates the legacy flat file)."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.rotation_index = 0
+        self.uids: Dict[str, str] = {}
+        self.load()
+
+    def load(self) -> None:
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            data = {}
+        except (json.JSONDecodeError, OSError) as exc:
+            log.warning("rotation state unreadable (%s); starting fresh", exc)
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        raw_uids = data.get("uids") if isinstance(data.get("uids"), dict) else data
+        self.uids = {str(k): str(v) for k, v in raw_uids.items()
+                     if isinstance(v, str)} if isinstance(raw_uids, dict) else {}
+        try:
+            self.rotation_index = int(data.get("rotation_index", 0))
+        except (TypeError, ValueError):
+            self.rotation_index = 0
+        self.rotation_index %= len(ROTATION)
+
+    def save(self) -> None:
+        try:
+            directory = os.path.dirname(self.path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            cutoff = time.time() - 45 * 86400
+            pruned = {k: v for k, v in self.uids.items()
+                      if isinstance(v, str) and _ts(v) >= cutoff}
+            payload = {
+                "version": 2,
+                "rotation_index": self.rotation_index % len(ROTATION),
+                "uids": pruned,
+            }
+            with open(self.path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=0)
+        except OSError as exc:
+            log.warning("could not save rotation state: %s", exc)
+
+    def seen(self, key: str) -> bool:
+        return bool(key) and key in self.uids
+
+    def mark(self, key: str) -> None:
+        if key:
+            self.uids[key] = datetime.now(timezone.utc).isoformat()
+
+    def advance(self, selected_index: int) -> None:
+        self.rotation_index = (selected_index + 1) % len(ROTATION)
+
+
+def fetch_json(url: str, stats: Dict[str, int]) -> Any:
+    for attempt in range(1, 4):
+        try:
+            resp = requests.get(url, headers=HTTP_HEADERS,
+                                timeout=CONFIG["fetch_timeout"])
+        except requests.RequestException as exc:
+            log.warning("json source %s -> %s (attempt %d)", url, exc, attempt)
+            if attempt < 3:
+                time.sleep(3 * attempt)
+                continue
+            stats["source_errors"] += 1
+            return None
+        if resp.status_code == 200:
+            try:
+                return resp.json()
+            except ValueError as exc:
+                log.warning("json source %s -> invalid JSON: %s", url, exc)
+                stats["source_errors"] += 1
+                return None
+        if resp.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+            try:
+                wait = int(resp.headers.get("Retry-After", "")) or 5 * attempt
+            except ValueError:
+                wait = 5 * attempt
+            wait = max(1, min(wait, 30))
+            log.warning("json source %s -> HTTP %s; retrying in %ss",
+                        url, resp.status_code, wait)
+            time.sleep(wait)
+            continue
+        log.warning("json source %s -> HTTP %s", url, resp.status_code)
+        stats["source_errors"] += 1
+        return None
+    stats["source_errors"] += 1
+    return None
+
+
+def fetch_feed_entries(name: str, tier: int, url: str, stats: Dict[str, int]) -> List[NewsItem]:
+    items: List[NewsItem] = []
+    try:
+        resp = requests.get(
+            url,
+            headers=HTTP_HEADERS,
+            timeout=CONFIG["fetch_timeout"],
+        )
+        if resp.status_code != 200:
+            log.warning("feed %s -> HTTP %s (skipped)", name, resp.status_code)
+            stats["source_errors"] += 1
+            return items
+        feed = feedparser.parse(resp.content)
+        if feed.bozo and not feed.entries:
+            log.warning("feed %s -> parse error (skipped)", name)
+            stats["source_errors"] += 1
+            return items
+        for entry in feed.entries:
+            title = _clean_spaces(strip_html(entry.get("title", "")))
+            link = (entry.get("link") or "").strip()
+            if not title or not link:
+                continue
+            published = _parse_published(entry)
+            summary = strip_html(entry.get("summary", "") or entry.get("description", ""))[:900]
+            source = name
+            source_info = entry.get("source")
+            if isinstance(source_info, dict) and source_info.get("title"):
+                source = _clean_spaces(str(source_info.get("title")))
+            suffix = " - " + source
+            if source and title.endswith(suffix):
+                title = title[:-len(suffix)].strip()
+            items.append(NewsItem(
+                title=title, link=link, summary=summary, source=source,
+                tier=tier, published=published, uid=item_uid(title, link),
+            ))
+        log.info("feed %-34s -> %d entries", name, len(items))
+        stats["fetched"] += len(items)
+    except requests.RequestException as exc:
+        log.warning("feed %s -> network error: %s", name, exc)
+        stats["source_errors"] += 1
+    except Exception as exc:  # noqa: BLE001
+        log.warning("feed %s -> unexpected error: %s", name, exc)
+        stats["source_errors"] += 1
+    return items
+
+
+def _fmt_rate(value: float) -> str:
+    if value >= 100:
+        return f"{value:,.2f}"
+    if value >= 1:
+        return f"{value:,.4f}".rstrip("0").rstrip(".")
+    return f"{value:.8f}".rstrip("0").rstrip(".")
+
+
+def _event_text(event: Dict[str, Any]) -> str:
+    title = _clean_spaces(str(event.get("title", "")))
+    parts = [f"د Forex Factory د کیلنڈر له مخې د امریکايي ډالرو (USD) لوړ اغېز پېښه: {title}."]
+    actual = _clean_spaces(str(event.get("actual", "")))
+    forecast = _clean_spaces(str(event.get("forecast", "")))
+    previous = _clean_spaces(str(event.get("previous", "")))
+    if actual:
+        parts.append(f"ثبت شوې کچه (Actual): {actual}.")
+    if forecast:
+        parts.append(f"تمه شوې کچه (Forecast): {forecast}.")
+    if previous:
+        parts.append(f"پخوانۍ کچه (Previous): {previous}.")
+    return " ".join(parts)
+
+
+def _ff_calendar_link(dt: datetime) -> str:
+    day = dt.astimezone(timezone.utc).strftime("%b%d.%Y").lower()
+    return f"https://www.forexfactory.com/calendar?day={day}"
+
+
+def economy_candidate(state: "RotationState", stats: Dict[str, int]) -> Optional[NewsItem]:
+    data = fetch_json(FOREX_FACTORY_URL, stats)
+    if not isinstance(data, list):
+        return None
+    now = datetime.now(timezone.utc)
+    best: Optional[NewsItem] = None
+    best_key: Optional[Tuple[float, float]] = None
+    for event in data:
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("country", "")).strip().upper() != "USD":
+            continue
+        if str(event.get("impact", "")).strip().lower() != "high":
+            continue
+        title = _clean_spaces(str(event.get("title", "")))
+        dt = _parse_dt(event.get("date"))
+        if not title or not dt:
+            continue
+        delta_hours = (dt - now).total_seconds() / 3600.0
+        # Recent releases and the next two weeks of scheduled high-impact events.
+        if delta_hours > 24 * 14 or delta_hours < -24:
+            continue
+        uid = "ff|usd|high|" + normalize_title(title) + "|" + dt.isoformat()
+        if state.seen(uid) or state.seen(title_fingerprint(title)):
+            continue
+        item = NewsItem(
+            title=f"USD High Impact: {title}",
+            link=_ff_calendar_link(dt),
+            summary=_event_text(event),
+            source="Forex Factory",
+            tier=3,
+            published=dt,
+            uid=uid,
+            category="economy",
+        )
+        item.facts = [value for value in (
+            _clean_spaces(str(event.get("actual", ""))),
+            _clean_spaces(str(event.get("forecast", ""))),
+            _clean_spaces(str(event.get("previous", ""))),
+        ) if value]
+        # Prefer a released event slightly, then the nearest event in time.
+        released = 0 if delta_hours <= 0 else 1
+        proximity = abs(delta_hours)
+        key = (released, proximity)
+        if best_key is None or key < best_key:
+            best_key = key
+            best = item
+    if best is None:
+        log.info("economy: no fresh USD high-impact event")
+    return best
+
+
+def date_candidate(state: "RotationState") -> Optional[NewsItem]:
+    now = datetime.now(AFGHAN_TZ)
+    uid = "date|" + now.date().isoformat()
+    if state.seen(uid):
+        return None
+    jy, jm, jd = gregorian_to_jalali(now.year, now.month, now.day)
+    weekday = WEEKDAYS_PS[now.weekday()]
+    month_ps = JALALI_MONTHS_PS[jm - 1]
+    summary = "\n".join([
+        f"میلادي نېټه: {now:%Y-%m-%d}",
+        f"د اونۍ ورځ: {weekday}",
+        f"هجري شمسي: {jy:04d}-{jm:02d}-{jd:02d} ({jd} {month_ps} {jy})",
+    ])
+    link = f"https://www.timeanddate.com/calendar/?year={now.year}&month={now.month}"
+    return NewsItem(
+        title=f"د نن ورځې نېټه — {now:%Y-%m-%d}",
+        link=link,
+        summary=summary,
+        source="Asia/Kabul local date",
+        tier=3,
+        published=now.astimezone(timezone.utc),
+        uid=uid,
+        category="date",
+    )
+
+
+def rates_candidate(state: "RotationState", stats: Dict[str, int]) -> Optional[NewsItem]:
+    today = datetime.now(AFGHAN_TZ).date().isoformat()
+    uid = "rates|" + today
+    if state.seen(uid):
+        return None
+    data = fetch_json(EXCHANGE_RATE_URL, stats)
+    if not isinstance(data, dict) or data.get("result") != "success":
+        return None
+    rates = data.get("rates")
+    if not isinstance(rates, dict):
+        return None
+    update_dt = _parse_dt(data.get("time_last_update_utc")) or _parse_dt(data.get("time_last_update_unix"))
+    if update_dt is None or age_hours(update_dt) > 48:
+        log.warning("rates: provider timestamp missing or stale")
+        return None
+    try:
+        afn = float(rates["AFN"])
+    except (KeyError, TypeError, ValueError):
+        log.warning("rates: AFN rate missing from provider")
+        return None
+    lines: List[str] = []
+    facts: List[str] = []
+    for code in ("USD", "EUR", "GBP", "PKR", "IRR"):
+        try:
+            per_afn = afn / float(rates[code])
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            continue
+        rendered = f"1 {code} = {_fmt_rate(per_afn)} AFN"
+        lines.append(rendered)
+        facts.append(rendered)
+    if len(lines) < 5:
+        log.warning("rates: incomplete currency basket; skipping")
+        return None
+    lines.append(f"د نرخ وخت: {update_dt:%Y-%m-%d %H:%M} UTC")
+    lines.append("دا نرخونه د ExchangeRate-API د حوالې معلوماتو له مخې دي.")
+    item = NewsItem(
+        title="د افغانۍ (AFN) په وړاندې د مهمو اسعارو نرخونه",
+        link=EXCHANGE_RATE_LINK,
+        summary="\n".join(lines),
+        source="ExchangeRate-API",
+        tier=3,
+        published=update_dt,
+        uid=uid,
+        category="rates",
+    )
+    item.facts = facts
+    return item
+
+
+def _category_match(category: str, text: str) -> bool:
+    if category == "afghan_tech":
+        return _has_any(text, AFGHAN_WORDS) and _has_any(text, TECH_WORDS)
+    if category == "jobs":
+        return _has_any(text, AFGHAN_WORDS) and _has_any(text, JOB_WORDS)
+    if category == "global_tech":
+        return _has_any(text, TECH_WORDS)
+    if category == "social":
+        return _has_any(text, SOCIAL_WORDS) and _has_any(text, UPDATE_WORDS)
+    return False
+
+
+def _job_details(item: NewsItem) -> List[str]:
+    if item.category != "jobs":
+        return []
+    text = item.summary
+    found: List[str] = []
+    patterns = (
+        ("د ادارې/شرکت", r"(?:organization|employer|company)\s*[:\-]\s*([^\n]{2,80}?)(?=\s+(?:closing date|deadline|posted|location|country|about us|job details|contract|duration|reporting)\b|$)"),
+        ("ځای", r"(?:location|duty station|city)\s*[:\-]\s*([A-Z][\w'’\-]*(?:,\s*[A-Z][\w'’\-]*)?)"),
+        ("وروستۍ نېټه", r"(?:closing date|deadline|apply before|closing)\s*[:\-]\s*([0-9]{1,2}\s+[A-Za-z]{3,9}\s+[0-9]{4}|[0-9]{1,2}[/\-][0-9]{1,2}[/\-][0-9]{2,4})"),
+    )
+    for label, pattern in patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            value = _clean_spaces(match.group(1)).strip(" .,-")
+            if value and len(value) >= 3:
+                found.append(f"{label}: {value}")
+    return found[:4]
+
+
+def _news_score(item: NewsItem, category: str) -> int:
+    text = item.text().lower()
+    set_map = {
+        "afghan_tech": TECH_WORDS,
+        "jobs": JOB_WORDS,
+        "global_tech": TECH_WORDS,
+        "social": UPDATE_WORDS,
+    }
+    score = {3: 30, 2: 20, 1: 10}.get(item.tier, 10)
+    age = age_hours(item.published)
+    if age <= 6:
+        score += 25
+    elif age <= 12:
+        score += 18
+    elif age <= 24:
+        score += 12
+    elif age <= 72:
+        score += 6
+    hits = sum(1 for word in set_map.get(category, ()) if _has_any(text, (word,)))
+    score += min(24, hits * 4)
+    if category in ("afghan_tech", "jobs"):
+        score += 10
+    if category == "global_tech" and _has_any(text, ("vulnerability", "ransomware", "breach", "launch", "release", "billion", "million")):
+        score += 8
+    if category == "social" and _has_any(text, ("privacy", "security", "policy", "outage", "ban", "feature")):
+        score += 8
+    return score
+
+
+def rss_candidate(category: str, state: "RotationState", stats: Dict[str, int]) -> Optional[NewsItem]:
+    max_age = 14 * 24 if category == "jobs" else CONFIG["max_age_hours"]
+    candidates: List[NewsItem] = []
+    for name, tier, url in CATEGORY_SOURCES.get(category, []):
+        for item in fetch_feed_entries(name, int(tier), url, stats):
+            if not _title_ok(item.title):
+                stats["filtered_short"] += 1
+                continue
+            age = age_hours(item.published)
+            if age > max_age or age < -6:
+                stats["filtered_old"] += 1
+                continue
+            if not _category_match(category, item.text()):
+                continue
+            if state.seen(item.uid) or state.seen(title_fingerprint(item.title)):
+                stats["filtered_dup"] += 1
+                continue
+            item.category = category
+            item.facts = _job_details(item)
+            item.score = _news_score(item, category)
+            candidates.append(item)
+        time.sleep(CONFIG["request_delay"])
+    if not candidates:
+        log.info("%s: no suitable fresh item", category)
+        return None
+    candidates.sort(key=lambda x: (
+        -x.score,
+        -((x.published or datetime.min.replace(tzinfo=timezone.utc)).timestamp()),
+    ))
+    log.info("%s: %d candidates, best score=%d", category, len(candidates), candidates[0].score)
+    return candidates[0]
+
+
+XAI_CHAT_URL = "https://api.x.ai/v1/chat/completions"
+
+
+def grok_compose(item: NewsItem) -> Optional[Tuple[str, str]]:
+    """Optional Grok rewrite. Facts are passed in; missing key -> safe fallback."""
+    api_key = CONFIG.get("grok_api_key", "")
+    if not api_key:
+        return None
+    context = "\n".join([
+        f"category: {item.category}",
+        f"source: {item.source}",
+        f"published_utc: {_post_date_line(item)}",
+        f"title: {item.title}",
+        f"summary: {item.summary[:1400]}",
+        f"facts: {'; '.join(item.facts[:6])}",
+        f"link: {item.link}",
+    ])
+    system_prompt = (
+        "You write short Telegram news posts in natural Pashto. "
+        "Use only the supplied title, summary, facts, source and date. "
+        "Never invent facts, numbers, quotes, names or links. Keep every number exactly as supplied. "
+        "Return strict JSON only, with keys headline and summary. "
+        "headline: one clear Pashto sentence, maximum 120 characters. "
+        "summary: one or two short Pashto sentences, maximum 420 characters."
+    )
+    payload = {
+        "model": CONFIG.get("grok_model") or "grok-4.1-fast",
+        "temperature": 0.2,
+        "max_tokens": 320,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": context},
+        ],
+    }
+    try:
+        resp = requests.post(
+            XAI_CHAT_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=40,
+        )
+        if resp.status_code != 200:
+            log.warning("grok API -> HTTP %s; using fallback", resp.status_code)
+            return None
+        data = resp.json()
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    except (requests.RequestException, ValueError, KeyError, IndexError) as exc:
+        log.warning("grok API error: %s; using fallback", exc)
+        return None
+    cleaned = re.sub(r"^```(?:json)?|```$", "", str(content).strip(), flags=re.M).strip()
+    match = re.search(r"\{.*\}", cleaned, re.S)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    headline = _clean_spaces(str(parsed.get("headline", "")))
+    summary = _clean_spaces(str(parsed.get("summary", "")))
+    if 8 <= len(headline) <= 160 and 30 <= len(summary) <= 700:
+        return headline, summary
+    log.warning("grok output failed validation; using fallback")
+    return None
+
+
+def _post_date_line(item: NewsItem) -> str:
+    if item.category == "date":
+        return datetime.now(AFGHAN_TZ).strftime("%Y-%m-%d (%H:%M Afghanistan)")
+    dt = item.published
+    if dt is None:
+        return "نېټه نه ده معلومه"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _fallback_body(item: NewsItem) -> str:
+    if item.category in ("economy", "date", "rates"):
+        return item.summary
+    parts = [f"د {item.source} د راپور له مخې دا مهم پرمختګ خپور شو: {item.title}."]
+    if item.category == "jobs":
+        parts.append("د دندې بشپړ تفصیل او د غوښتنلیک لینک د سرچینې په لینک کې دی.")
+        return " ".join(parts)
+    facts = item.facts or _extract_facts(item.text())[:3]
+    if facts:
+        parts.append("د خبر مهم معلومات: " + "؛ ".join(facts) + ".")
+    else:
+        parts.append("د بشپړ متن لپاره د اصلي سرچینې لینک وګورئ.")
+    return " ".join(parts)
+
+
+def render_rotation_post(item: NewsItem) -> str:
+    emoji, label, tags = CATEGORY_META[item.category]
+    headline = item.title
+    body = item.summary
+    if item.category in ("economy", "afghan_tech", "jobs", "global_tech", "social"):
+        composed = grok_compose(item)
+        if composed:
+            headline, body = composed
+            log.info("grok: composed Pashto post for %s", item.category)
+        else:
+            body = _fallback_body(item)
+    body = body[:1400]
+    lines: List[str] = [
+        f"{emoji} {headline}",
+        "",
+        body,
+        "",
+        f"📅 نېټه: {_post_date_line(item)}",
+        f"🔗 سرچینه: {item.source}",
+        item.link,
+        " ".join(tags),
+    ]
+    if item.category == "jobs" and item.facts:
+        lines.insert(3, "💼 " + " | ".join(item.facts[:4]))
+    return "\n".join(lines)
+
+
+def candidate_for(category: str, state: RotationState, stats: Dict[str, int]) -> Optional[NewsItem]:
+    if category == "economy":
+        return economy_candidate(state, stats)
+    if category == "date":
+        return date_candidate(state)
+    if category == "rates":
+        return rates_candidate(state, stats)
+    return rss_candidate(category, state, stats)
+
+
+def main_rotation() -> int:
+    setup_logging()
+    log.info("Sequential news bot starting: one post per run, order=%s", " -> ".join(ROTATION))
+    if not CONFIG["dry_run"] and (not CONFIG["token"] or not CONFIG["chat_id"]):
+        log.error("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set. "
+                  "Set them as environment variables (GitHub Secrets).")
+        return 2
+
+    stats = new_stats()
+    state = RotationState(CONFIG["state_file"])
+    start = state.rotation_index % len(ROTATION)
+    log.info("rotation start: %s (index %d)", ROTATION[start], start)
+
+    selected: Optional[NewsItem] = None
+    selected_index: Optional[int] = None
+    for offset in range(len(ROTATION)):
+        index = (start + offset) % len(ROTATION)
+        category = ROTATION[index]
+        try:
+            candidate = candidate_for(category, state, stats)
+        except Exception as exc:  # noqa: BLE001 — never kill the whole run
+            log.error("category %s failed: %s", category, exc)
+            stats["source_errors"] += 1
+            candidate = None
+        if candidate is None:
+            log.info("category %s: skipped (no suitable item)", category)
+            continue
+        selected = candidate
+        selected_index = index
+        break
+
+    if selected is None or selected_index is None:
+        log.info("no category had a suitable item; nothing posted this run")
+    else:
+        try:
+            post = render_rotation_post(selected)
+        except Exception as exc:  # noqa: BLE001
+            log.error("render failed for category %s: %s", selected.category, exc)
+            post = ""
+        if post:
+            ok = send_to_telegram(post, stats)
+            if ok:
+                state.mark(selected.uid)
+                state.mark(title_fingerprint(selected.title))
+                state.advance(selected_index)
+                if not CONFIG["dry_run"]:
+                    state.save()
+                log.info("posted category=%s; next=%s",
+                         selected.category, ROTATION[state.rotation_index])
+        else:
+            log.error("empty post for category %s; rotation not advanced", selected.category)
+
+    log.info("=== summary: fetched=%d dup=%d old=%d short=%d posted=%d "
+             "send_errors=%d source_errors=%d next=%s ===",
+             stats["fetched"], stats["filtered_dup"], stats["filtered_old"],
+             stats["filtered_short"], stats["posted"], stats["send_errors"],
+             stats["source_errors"],
+             ROTATION[state.rotation_index % len(ROTATION)])
+    return 0 if stats["send_errors"] == 0 else 1
+
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main_rotation())
 
 

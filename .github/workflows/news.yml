@@ -1,18 +1,11 @@
 name: General News Bot — Technology & Economy
 
-# Frequency is configured here — change the cron to adjust posting rate.
-# Examples:
-#   every 30 minutes:  */30 * * * *
-#   every hour:        0 * * * *
-#   every 2 hours:     0 */2 * * *
-# NOTE: GitHub may delay scheduled workflows by a few minutes.
+# One post per run, rotating through a fixed seven-category cycle.
+# GitHub may delay scheduled workflows by a few minutes.
 on:
   schedule:
     - cron: "*/30 * * * *"
   workflow_dispatch: {}
-  # also run when code is pushed to main (handy for testing after a change)
-  push:
-    branches: [main]
 
 concurrency:
   group: general-news-bot
@@ -34,8 +27,8 @@ jobs:
           cache: pip
           cache-dependency-path: requirements.txt
 
-      - name: Restore duplicate-protection state
-        uses: actions/cache@v4
+      - name: Restore rotation + duplicate protection state
+        uses: actions/cache/restore@v4
         with:
           path: state/posted.json
           key: newsbot-state-${{ github.run_id }}
@@ -49,6 +42,17 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MAX_POSTS_PER_RUN: "4"
+          GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
+          GROK_MODEL: ${{ vars.GROK_MODEL }}
+          MAX_POSTS_PER_RUN: "1"
           MAX_AGE_HOURS: "36"
+          STATE_FILE: "state/posted.json"
         run: python bot.py
+
+      - name: Save rotation + duplicate protection state
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: state/posted.json
+          key: newsbot-state-${{ github.run_id }}
