@@ -10,6 +10,9 @@ on:
   schedule:
     - cron: "*/30 * * * *"
   workflow_dispatch: {}
+  # also run when code is pushed to main (handy for testing after a change)
+  push:
+    branches: [main]
 
 concurrency:
   group: general-news-bot
