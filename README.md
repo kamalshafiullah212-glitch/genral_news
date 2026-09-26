@@ -1,4 +1,4 @@
-# Pashto News Bot — Technology & Economy (ټکنالوژۍ او اقتصاد)
+# Pashto News Bot — Sequential Rotation (اقتصاد، نېټه، اسعار، ټکنالوژي، دندې، ټولنیز)
 
 A single Telegram bot that publishes one post per run in a fixed seven-category
 cycle, in Pashto, from verified public sources. It runs on GitHub Actions.
@@ -30,6 +30,11 @@ cycle, in Pashto, from verified public sources. It runs on GitHub Actions.
 | 🌍 global_tech | The Verge, TechCrunch, Ars Technica, NVIDIA, Google News global technology (AI included) |
 | 📱 social | Google News RSS — Facebook/Meta, Instagram, TikTok, YouTube, Telegram, WhatsApp, Snapchat, LinkedIn, X updates |
 
+> **economy:** Forex Factory's public feed only covers the current week. If the
+> week has no `USD` + `High` impact event (or the feed is briefly rate-limited),
+> that category is skipped for the run and the cycle moves on — nothing is
+> invented to fill the slot.
+
 Every post includes the category, a short Pashto text, `📅 نېټه`, `🔗 سرچینه`,
 the original link, and category hashtags. Numbers, currencies and dates are
 copied from the source and are never invented.
@@ -51,8 +56,8 @@ variables → Actions → Variables). Default when empty: `grok-4.1-fast`.
    * `TELEGRAM_BOT_TOKEN` — from @BotFather
    * `TELEGRAM_CHAT_ID` — target chat/channel id (digits only, from @userinfobot)
    * `GROK_API_KEY` — optional, for AI-written Pashto wording
-3. Open the **Actions** tab and run *General News Bot — Technology & Economy*
-   once with **Run workflow** to verify.
+3. Open the **Actions** tab, select *General News Bot — Sequential Pashto
+   Rotation*, and click **Run workflow** once to verify.
 
 ## Local dry run
 

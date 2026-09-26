@@ -1,4 +1,4 @@
-name: General News Bot — Technology & Economy
+name: General News Bot — Sequential Pashto Rotation
 
 # One post per run, rotating through a fixed seven-category cycle.
 # GitHub may delay scheduled workflows by a few minutes.
@@ -28,6 +28,7 @@ jobs:
           cache-dependency-path: requirements.txt
 
       - name: Restore rotation + duplicate protection state
+        continue-on-error: true
         uses: actions/cache/restore@v4
         with:
           path: state/posted.json
