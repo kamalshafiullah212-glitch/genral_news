@@ -1,21 +1,27 @@
-# Pashto News Bot — Sequential Rotation (اقتصاد، نېټه، اسعار، ټکنالوژي، دندې، ټولنیز)
+# Pashto News Bot — Daily Schedule (اقتصاد، نېټه، اسعار، ټکنالوژي، دندې، ټولنیز)
 
-A single Telegram bot that publishes one post per run in a fixed seven-category
-cycle, in Pashto, from verified public sources. It runs on GitHub Actions.
+A single Telegram bot that publishes in Pashto from verified public sources and
+runs on GitHub Actions, every 30 minutes.
 
-## Sequential publication cycle
+## Daily schedule (Asia/Kabul, UTC+4:30)
 
 ```
-💵 economy -> 📅 date -> 💱 rates -> 🇦🇫 afghan_tech
--> 💼 jobs -> 🌍 global_tech -> 📱 social -> (new cycle)
+06:00  📅 date  +  💱 rates   (once a day, right after six o'clock)
+...    🗞 economy / afghan_tech / jobs / global_tech / social
+       published as soon as a fresh item is found, all day long
 ```
 
-* **One post per run** (`MAX_POSTS_PER_RUN=1`). The workflow runs every 30
-  minutes, so categories are spaced out instead of flooding the channel.
-* The current position is stored in `state/posted.json` and restored/saved with
-  the GitHub Actions cache. A category that has no suitable item is skipped for
-  that run; the next suitable category is posted and the cycle continues.
-* The **date** and **rates** categories post at most once per day.
+* **📅 date and 💱 rates are time-locked to 06:00.** The first run at or after
+  06:00 Kabul publishes both, once each; no later run repeats them that day.
+* **All other news is published as soon as it appears.** Every run looks for
+  the freshest unseen item, scanning the five news categories in a fair
+  rotation (`economy -> afghan_tech -> jobs -> global_tech -> social`) so no
+  category starves.
+* **At least 15 posts per day** (and at most about 20, `DAILY_MAX_POSTS`). The
+  day is paced from 06:00 so posts are spread out instead of dumped in one
+  burst. If the bot falls behind the 15/day pace it automatically allows older
+  items (up to `CATCHUP_MAX_AGE_HOURS`) to catch up; if there is simply no
+  suitable item, that run posts nothing rather than inventing news.
 * Duplicate links and titles are remembered and never posted twice.
 
 ## Category sources
@@ -39,12 +45,14 @@ Every post includes the category, a short Pashto text, `📅 نېټه`, `🔗 س
 the original link, and category hashtags. Numbers, currencies and dates are
 copied from the source and are never invented.
 
-## Optional Grok writing
+## Grok writing (news categories)
 
-If `GROK_API_KEY` is set as a GitHub Secret, the bot asks Grok to rewrite the
-supplied title/summary into a short natural Pashto post. The API call uses only
-the supplied facts and numbers. If the key is absent or the API fails, the bot
-uses a safe built-in fallback and still posts.
+For `economy`, `afghan_tech`, `jobs`, `global_tech` and `social`, the bot asks
+Grok to turn the supplied title/summary into a short natural Pashto post. The
+API call uses only the supplied facts and numbers. **If `GROK_API_KEY` is absent
+or the call fails, a safe built-in summary is posted instead** so the daily
+15-post target is not lost. `date` and `rates` are never rewritten — their
+numbers come straight from the source.
 
 `GROK_MODEL` can be set as a repository **variable** (Settings → Secrets and
 variables → Actions → Variables). Default when empty: `grok-4.1-fast`.
@@ -56,8 +64,8 @@ variables → Actions → Variables). Default when empty: `grok-4.1-fast`.
    * `TELEGRAM_BOT_TOKEN` — from @BotFather
    * `TELEGRAM_CHAT_ID` — target chat/channel id (digits only, from @userinfobot)
    * `GROK_API_KEY` — optional, for AI-written Pashto wording
-3. Open the **Actions** tab, select *General News Bot — Sequential Pashto
-   Rotation*, and click **Run workflow** once to verify.
+3. Open the **Actions** tab, select *General News Bot — Daily Pashto News*,
+   and click **Run workflow** once to verify.
 
 ## Local dry run
 
@@ -80,16 +88,25 @@ Environment variables:
 | `TELEGRAM_BOT_TOKEN` | Bot token (required to send) |
 | `TELEGRAM_CHAT_ID` | Target chat id (required to send) |
 | `DRY_RUN` | `1` = print only, never send |
-| `MAX_POSTS_PER_RUN` | Keep at `1` for the sequential cycle |
-| `MAX_AGE_HOURS` | Ignore older news items (workflow uses 36) |
+| `DAY_ANCHOR_HOUR` | Kabul hour when date + rates are published (default `6`) |
+| `DAILY_MIN_POSTS` | Minimum posts per news day (default `15`) |
+| `DAILY_MAX_POSTS` | Upper bound / pacing target per news day (default `20`) |
+| `CATCHUP_MAX_AGE_HOURS` | Age limit used while catching up (default `168`) |
+| `MAX_POSTS_PER_RUN` | Kept for compatibility; the schedule itself now paces posting |
+| `MAX_AGE_HOURS` | Ignore older news items in normal mode (workflow uses 36) |
 | `MIN_SCORE` | Minimum relevance score for RSS candidates |
 | `STATE_FILE` | Persisted rotation/duplicate state path |
 | `GROK_API_KEY` | Optional xAI key used only for Pashto wording |
 | `GROK_MODEL` | Optional model name; defaults to `grok-4.1-fast` |
 
+> GitHub cron is UTC, so 06:00 Kabul is `01:30 UTC` (`cron: "*/30 * * * *"`
+> already covers it). GitHub may delay a scheduled run by a few minutes; the bot
+> posts at the first run at or after 06:00, so a short delay is harmless.
+
 ## Duplicate protection
 
-State stores the URL/hash of every posted item and the current rotation index.
-Old entries are pruned after 45 days. The workflow restores the newest
-`newsbot-state-*` cache and saves the updated state after every run with
-`if: always()`, so the cycle survives failures.
+State stores the URL/hash of every posted item, the news rotation index, the
+current news-day key, how many posts that day already had, and whether the daily
+date/rates were published. Old entries are pruned after 45 days. The workflow
+restores the newest `newsbot-state-*` cache and saves the updated state after
+every run with `if: always()`, so the schedule survives failures.

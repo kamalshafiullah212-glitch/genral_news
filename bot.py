@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Sequential Pashto news bot — Technology, Economy, Rates, Jobs & Social Media.
+Daily Pashto news bot — Economy, Dates, Rates, Afghan Tech, Jobs, Global Tech
+and Social Media, running on GitHub Actions.
 
-The bot publishes exactly one post per run in a fixed rotation:
+Daily schedule (all times Asia/Kabul, UTC+4:30):
 
-    economy -> date -> rates -> afghan_tech -> jobs -> global_tech -> social
-
-* economy: only USD High-impact events from the Forex Factory calendar.
-* date: the daily date in Asia/Kabul, Gregorian + Solar Hijri.
-* rates: USD/EUR/GBP/PKR/IRR against AFN from ExchangeRate-API with timestamp.
-* afghan_tech / jobs / global_tech / social: category-specific RSS filters.
-* Optional Grok writing (GROK_API_KEY) for natural Pashto summaries; a safe
-  fallback is used when the key is missing or the API fails.
+* 📅 date and 💱 rates are published **once a day, right after 06:00**.
+* 🗞 every other run publishes the freshest suitable news item it finds
+  (economy -> afghan_tech -> jobs -> global_tech -> social, fair rotation),
+  paced so the day reaches at least 15 and at most about 20 posts.
+* Grok (GROK_API_KEY) rewrites the news text into natural Pashto; if the key is
+  missing or the call fails, a safe built-in summary is posted instead so the
+  daily volume is not lost.
+* Nothing is invented: dates, rates and calendar events always come from the
+  source data.
 
 Notes:
   * Secrets come only from environment variables (GitHub Secrets in CI).
-  * Dry-run: set DRY_RUN=1 to print the post instead of sending it.
+  * Dry-run: set DRY_RUN=1 to print posts instead of sending them.
 """
 
 from __future__ import annotations
@@ -61,6 +63,15 @@ CONFIG = {
     "request_delay": 0.35,
     "grok_api_key": os.environ.get("GROK_API_KEY", "").strip(),
     "grok_model": os.environ.get("GROK_MODEL", "grok-4.1-fast").strip(),
+    # --- daily schedule (Asia/Kabul) -------------------------------------
+    # date + rates are published once a day right after this local hour.
+    "day_anchor_hour": env_int("DAY_ANCHOR_HOUR", 6),
+    # The news day is anchored at day_anchor_hour; all posts count toward it.
+    "daily_min_posts": env_int("DAILY_MIN_POSTS", 15),
+    "daily_max_posts": env_int("DAILY_MAX_POSTS", 20),
+    # When the bot falls behind the 15/day minimum, older items are allowed
+    # as a catch-up (fresh items always win on score).
+    "catchup_max_age_hours": env_int("CATCHUP_MAX_AGE_HOURS", 7 * 24),
 }
 
 log = logging.getLogger("newsbot")
@@ -140,8 +151,10 @@ AI_STRONG = [
     "ai system", "ai systems", "chatbot",
 ]
 AI_STANDALONE = re.compile(r"\bAI\b")
-# Sequential publication order. Every successful run publishes one category only.
+# Publication order. date + rates are time-locked to 06:00 Kabul; the rest are
+# published as soon as a fresh item is found, in this fair rotation order.
 ROTATION = ["economy", "date", "rates", "afghan_tech", "jobs", "global_tech", "social"]
+NEWS_ROTATION = ["economy", "afghan_tech", "jobs", "global_tech", "social"]
 CATEGORY_META = {
     "economy": ("💵", "اقتصاد", ["#Economy", "#USD_High_Impact"]),
     "date": ("📅", "ورځنی تاریخ", ["#Date"]),
@@ -1084,6 +1097,10 @@ class RotationState:
         self.path = path
         self.rotation_index = 0
         self.uids: Dict[str, str] = {}
+        # daily bookkeeping (version 3)
+        self.day_key = ""
+        self.day_count = 0
+        self.special: Dict[str, str] = {}
         self.load()
 
     def load(self) -> None:
@@ -1104,7 +1121,32 @@ class RotationState:
             self.rotation_index = int(data.get("rotation_index", 0))
         except (TypeError, ValueError):
             self.rotation_index = 0
-        self.rotation_index %= len(ROTATION)
+        self.rotation_index %= len(NEWS_ROTATION)
+        self.day_key = str(data.get("day_key", "") or "")
+        try:
+            self.day_count = max(0, int(data.get("day_count", 0)))
+        except (TypeError, ValueError):
+            self.day_count = 0
+        raw_special = data.get("special") if isinstance(data.get("special"), dict) else {}
+        self.special = {str(k): str(v) for k, v in raw_special.items()
+                        if isinstance(v, str)}
+
+    def start_day(self, day_key: str) -> None:
+        """Reset the daily counters when a new 06:00-anchored day begins."""
+        if day_key != self.day_key:
+            log.info("new news day %s (previous=%s, posts=%d)",
+                     day_key, self.day_key or "-", self.day_count)
+            self.day_key = day_key
+            self.day_count = 0
+
+    def bump_day(self) -> None:
+        self.day_count += 1
+
+    def special_done(self, kind: str, day_key: str) -> bool:
+        return self.special.get(kind) == day_key
+
+    def mark_special(self, kind: str, day_key: str) -> None:
+        self.special[kind] = day_key
 
     def save(self) -> None:
         try:
@@ -1115,8 +1157,11 @@ class RotationState:
             pruned = {k: v for k, v in self.uids.items()
                       if isinstance(v, str) and _ts(v) >= cutoff}
             payload = {
-                "version": 2,
-                "rotation_index": self.rotation_index % len(ROTATION),
+                "version": 3,
+                "rotation_index": self.rotation_index % len(NEWS_ROTATION),
+                "day_key": self.day_key,
+                "day_count": self.day_count,
+                "special": self.special,
                 "uids": pruned,
             }
             with open(self.path, "w", encoding="utf-8") as fh:
@@ -1132,7 +1177,7 @@ class RotationState:
             self.uids[key] = datetime.now(timezone.utc).isoformat()
 
     def advance(self, selected_index: int) -> None:
-        self.rotation_index = (selected_index + 1) % len(ROTATION)
+        self.rotation_index = (selected_index + 1) % len(NEWS_ROTATION)
 
 
 def fetch_json(url: str, stats: Dict[str, int]) -> Any:
@@ -1432,8 +1477,10 @@ def _news_score(item: NewsItem, category: str) -> int:
     return score
 
 
-def rss_candidate(category: str, state: "RotationState", stats: Dict[str, int]) -> Optional[NewsItem]:
-    max_age = 14 * 24 if category == "jobs" else CONFIG["max_age_hours"]
+def rss_candidate(category: str, state: "RotationState", stats: Dict[str, int],
+                  max_age_hours: Optional[int] = None) -> Optional[NewsItem]:
+    default_age = 14 * 24 if category == "jobs" else CONFIG["max_age_hours"]
+    max_age = max(default_age, max_age_hours or 0)
     candidates: List[NewsItem] = []
     for name, tier, url in CATEGORY_SOURCES.get(category, []):
         for item in fetch_feed_entries(name, int(tier), url, stats):
@@ -1586,19 +1633,81 @@ def render_rotation_post(item: NewsItem) -> str:
     return "\n".join(lines)
 
 
-def candidate_for(category: str, state: RotationState, stats: Dict[str, int]) -> Optional[NewsItem]:
+def candidate_for(category: str, state: RotationState, stats: Dict[str, int],
+                  max_age_hours: Optional[int] = None) -> Optional[NewsItem]:
     if category == "economy":
         return economy_candidate(state, stats)
     if category == "date":
         return date_candidate(state)
     if category == "rates":
         return rates_candidate(state, stats)
-    return rss_candidate(category, state, stats)
+    return rss_candidate(category, state, stats, max_age_hours)
+
+
+# ---------------------------------------------------------------------------
+# Daily pacing (Asia/Kabul): date + rates at 06:00, news spread over the day
+# ---------------------------------------------------------------------------
+
+def _kabul_now() -> datetime:
+    return datetime.now(AFGHAN_TZ)
+
+
+def news_day_key(now: Optional[datetime] = None) -> str:
+    """Key of the 24h window that starts at DAY_ANCHOR_HOUR (Kabul)."""
+    moment = now or _kabul_now()
+    if moment.hour < CONFIG["day_anchor_hour"]:
+        moment = moment - timedelta(days=1)
+    return moment.date().isoformat()
+
+
+def minutes_into_news_day(now: Optional[datetime] = None) -> int:
+    moment = now or _kabul_now()
+    anchor = moment.replace(hour=CONFIG["day_anchor_hour"], minute=0,
+                            second=0, microsecond=0)
+    if moment < anchor:
+        anchor -= timedelta(days=1)
+    return max(0, int((moment - anchor).total_seconds() // 60))
+
+
+def paced_allowance(minutes: int) -> int:
+    """How many posts may exist by now (spread up to DAILY_MAX_POSTS/day)."""
+    per_day = max(CONFIG["daily_min_posts"], CONFIG["daily_max_posts"], 1)
+    interval = max(1, 1440 // per_day)
+    return min(per_day, 1 + minutes // interval)
+
+
+def behind_minimum(minutes: int, count: int) -> bool:
+    """True when the day is behind the DAILY_MIN_POSTS pace (catch-up mode)."""
+    need = 1 + (minutes * CONFIG["daily_min_posts"]) // 1440
+    return count < need
+
+
+def _post_once(item: NewsItem, state: RotationState,
+               stats: Dict[str, int]) -> bool:
+    """Render + send one item; on success remember it and count the day post."""
+    try:
+        post = render_rotation_post(item)
+    except Exception as exc:  # noqa: BLE001 — never kill the whole run
+        log.error("render failed for category %s: %s", item.category, exc)
+        return False
+    if not post:
+        log.error("empty post for category %s", item.category)
+        return False
+    if not send_to_telegram(post, stats):
+        return False
+    state.mark(item.uid)
+    state.mark(title_fingerprint(item.title))
+    state.bump_day()
+    log.info("posted category=%s (day posts=%d)", item.category, state.day_count)
+    return True
 
 
 def main_rotation() -> int:
     setup_logging()
-    log.info("Sequential news bot starting: one post per run, order=%s", " -> ".join(ROTATION))
+    log.info("Daily news bot starting: date+rates at %02d:00 Kabul, "
+             "news as soon as found (target %d-%d posts/day)",
+             CONFIG["day_anchor_hour"], CONFIG["daily_min_posts"],
+             CONFIG["daily_max_posts"])
     if not CONFIG["dry_run"] and (not CONFIG["token"] or not CONFIG["chat_id"]):
         log.error("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set. "
                   "Set them as environment variables (GitHub Secrets).")
@@ -1606,54 +1715,79 @@ def main_rotation() -> int:
 
     stats = new_stats()
     state = RotationState(CONFIG["state_file"])
-    start = state.rotation_index % len(ROTATION)
-    log.info("rotation start: %s (index %d)", ROTATION[start], start)
+    now = _kabul_now()
+    day_key = news_day_key(now)
+    minutes = minutes_into_news_day(now)
+    state.start_day(day_key)
+    allowance = paced_allowance(minutes)
+    log.info("kabul=%s | news day=%s | posts=%d | allowance=%d",
+             now.strftime("%Y-%m-%d %H:%M"), day_key, state.day_count, allowance)
 
-    selected: Optional[NewsItem] = None
-    selected_index: Optional[int] = None
-    for offset in range(len(ROTATION)):
-        index = (start + offset) % len(ROTATION)
-        category = ROTATION[index]
-        try:
-            candidate = candidate_for(category, state, stats)
-        except Exception as exc:  # noqa: BLE001 — never kill the whole run
-            log.error("category %s failed: %s", category, exc)
-            stats["source_errors"] += 1
-            candidate = None
-        if candidate is None:
-            log.info("category %s: skipped (no suitable item)", category)
-            continue
-        selected = candidate
-        selected_index = index
-        break
-
-    if selected is None or selected_index is None:
-        log.info("no category had a suitable item; nothing posted this run")
+    # --- 1) date + rates: once a day, right after the anchor hour ----------
+    if now.hour >= CONFIG["day_anchor_hour"]:
+        for kind in ("date", "rates"):
+            if state.special_done(kind, day_key):
+                log.info("%s: already posted today", kind)
+                continue
+            try:
+                candidate = candidate_for(kind, state, stats)
+            except Exception as exc:  # noqa: BLE001 — never kill the whole run
+                log.error("category %s failed: %s", kind, exc)
+                stats["source_errors"] += 1
+                candidate = None
+            if candidate is None:
+                log.info("%s: skipped (no suitable item)", kind)
+                continue
+            if _post_once(candidate, state, stats):
+                state.mark_special(kind, day_key)
+            else:
+                log.error("%s: not posted; will retry next run", kind)
     else:
-        try:
-            post = render_rotation_post(selected)
-        except Exception as exc:  # noqa: BLE001
-            log.error("render failed for category %s: %s", selected.category, exc)
-            post = ""
-        if post:
-            ok = send_to_telegram(post, stats)
-            if ok:
-                state.mark(selected.uid)
-                state.mark(title_fingerprint(selected.title))
-                state.advance(selected_index)
-                if not CONFIG["dry_run"]:
-                    state.save()
-                log.info("posted category=%s; next=%s",
-                         selected.category, ROTATION[state.rotation_index])
-        else:
-            log.error("empty post for category %s; rotation not advanced", selected.category)
+        log.info("date/rates wait for %02d:00 Kabul",
+                 CONFIG["day_anchor_hour"])
+
+    # --- 2) other news: publish as soon as found, paced across the day -----
+    if state.day_count >= allowance:
+        log.info("daily pace reached (%d/%d); no news post this run",
+                 state.day_count, allowance)
+    else:
+        relax = behind_minimum(minutes, state.day_count)
+        if relax:
+            log.info("behind the %d/day minimum; allowing items up to %dh old",
+                     CONFIG["daily_min_posts"], CONFIG["catchup_max_age_hours"])
+        start = state.rotation_index % len(NEWS_ROTATION)
+        log.info("news rotation start: %s (index %d)", NEWS_ROTATION[start], start)
+        found_any = False
+        for offset in range(len(NEWS_ROTATION)):
+            index = (start + offset) % len(NEWS_ROTATION)
+            category = NEWS_ROTATION[index]
+            try:
+                candidate = candidate_for(
+                    category, state, stats,
+                    CONFIG["catchup_max_age_hours"] if relax else None)
+            except Exception as exc:  # noqa: BLE001 — never kill the whole run
+                log.error("category %s failed: %s", category, exc)
+                stats["source_errors"] += 1
+                candidate = None
+            if candidate is None:
+                log.info("category %s: skipped (no suitable item)", category)
+                continue
+            found_any = True
+            if _post_once(candidate, state, stats):
+                state.advance(index)
+            break
+        if not found_any:
+            log.info("no category had a suitable item; nothing posted this run")
+
+    if not CONFIG["dry_run"]:
+        state.save()
 
     log.info("=== summary: fetched=%d dup=%d old=%d short=%d posted=%d "
-             "send_errors=%d source_errors=%d next=%s ===",
+             "send_errors=%d source_errors=%d day_posts=%d/%d next=%s ===",
              stats["fetched"], stats["filtered_dup"], stats["filtered_old"],
              stats["filtered_short"], stats["posted"], stats["send_errors"],
-             stats["source_errors"],
-             ROTATION[state.rotation_index % len(ROTATION)])
+             stats["source_errors"], state.day_count, CONFIG["daily_max_posts"],
+             NEWS_ROTATION[state.rotation_index % len(NEWS_ROTATION)])
     return 0 if stats["send_errors"] == 0 else 1
 
 

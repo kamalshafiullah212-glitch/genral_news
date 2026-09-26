@@ -1,4 +1,4 @@
-name: General News Bot — Sequential Pashto Rotation
+name: General News Bot — Daily Pashto News
 
 # One post per run, rotating through a fixed seven-category cycle.
 # GitHub may delay scheduled workflows by a few minutes.
@@ -47,6 +47,12 @@ jobs:
           GROK_MODEL: ${{ vars.GROK_MODEL }}
           MAX_POSTS_PER_RUN: "1"
           MAX_AGE_HOURS: "36"
+          # date + rates once a day right after 06:00 Asia/Kabul
+          DAY_ANCHOR_HOUR: "6"
+          # spread the news posts across the day: 15 minimum, ~20 maximum
+          DAILY_MIN_POSTS: "15"
+          DAILY_MAX_POSTS: "20"
+          CATCHUP_MAX_AGE_HOURS: "168"
           STATE_FILE: "state/posted.json"
         run: python bot.py
 
