@@ -61,8 +61,17 @@ CONFIG = {
     "state_file": os.environ.get("STATE_FILE", "state/posted.json").strip(),
     "fetch_timeout": env_int("FETCH_TIMEOUT", 20),
     "request_delay": 0.35,
+    # --- LLM writer: Groq (preferred) or xAI Grok -------------------------
+    "groq_api_key": os.environ.get("GROQ_API_KEY", "").strip(),
+    "groq_model": (os.environ.get("GROQ_MODEL", "").strip()
+                   or os.environ.get("LLM_MODEL", "").strip()
+                   or "openai/gpt-oss-120b"),
     "grok_api_key": os.environ.get("GROK_API_KEY", "").strip(),
-    "grok_model": os.environ.get("GROK_MODEL", "grok-4.1-fast").strip(),
+    "grok_model": (os.environ.get("GROK_MODEL", "").strip()
+                   or os.environ.get("LLM_MODEL", "").strip()
+                   or "grok-4.1-fast"),
+    "llm_base_url": os.environ.get("LLM_BASE_URL", "").strip(),
+    "llm_timeout": env_int("LLM_TIMEOUT", 60),
     # --- daily schedule (Asia/Kabul) -------------------------------------
     # date + rates are published once a day right after this local hour.
     "day_anchor_hour": env_int("DAY_ANCHOR_HOUR", 6),
@@ -1512,14 +1521,56 @@ def rss_candidate(category: str, state: "RotationState", stats: Dict[str, int],
     return candidates[0]
 
 
+GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 XAI_CHAT_URL = "https://api.x.ai/v1/chat/completions"
 
 
-def grok_compose(item: NewsItem) -> Optional[Tuple[str, str]]:
-    """Optional Grok rewrite. Facts are passed in; missing key -> safe fallback."""
-    api_key = CONFIG.get("grok_api_key", "")
-    if not api_key:
+def llm_target() -> Optional[Tuple[str, str, str]]:
+    """Resolve (endpoint, api_key, model). Groq wins when both keys are set."""
+    if CONFIG["llm_base_url"]:
+        base = CONFIG["llm_base_url"].rstrip("/")
+        url = base if base.endswith("/chat/completions") else base + "/chat/completions"
+        key = CONFIG["groq_api_key"] or CONFIG["grok_api_key"]
+        if key:
+            model = CONFIG["groq_model"] if CONFIG["groq_api_key"] else CONFIG["grok_model"]
+            return url, key, model
+    if CONFIG["groq_api_key"]:
+        return GROQ_CHAT_URL, CONFIG["groq_api_key"], CONFIG["groq_model"]
+    if CONFIG["grok_api_key"]:
+        return XAI_CHAT_URL, CONFIG["grok_api_key"], CONFIG["grok_model"]
+    return None
+
+
+def _parse_llm_reply(content: str) -> Optional[Tuple[str, str]]:
+    cleaned = re.sub(r"^```(?:json)?|```$", "", str(content).strip(), flags=re.M).strip()
+    match = re.search(r"\{.*\}", cleaned, re.S)
+    if not match:
+        log.warning("llm reply had no JSON; using fallback")
         return None
+    try:
+        parsed = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        log.warning("llm reply was not valid JSON; using fallback")
+        return None
+    headline = _clean_spaces(str(parsed.get("headline", "")))
+    summary = _clean_spaces(str(parsed.get("summary", "")))
+    if 8 <= len(headline) <= 160 and 30 <= len(summary) <= 700:
+        return headline, summary
+    log.warning("llm output failed validation; using fallback")
+    return None
+
+
+def llm_compose(item: NewsItem) -> Optional[Tuple[str, str]]:
+    """Rewrite a news item into Pashto with Groq or xAI Grok.
+
+    Facts are passed in; a missing key, a network/HTTP error, rate limiting or
+    an invalid answer all return None so the caller uses its safe fallback.
+    """
+    target = llm_target()
+    if target is None:
+        log.info("no GROQ_API_KEY / GROK_API_KEY set; using built-in Pashto summary")
+        return None
+    url, api_key, model = target
     context = "\n".join([
         f"category: {item.category}",
         f"source: {item.source}",
@@ -1537,46 +1588,56 @@ def grok_compose(item: NewsItem) -> Optional[Tuple[str, str]]:
         "headline: one clear Pashto sentence, maximum 120 characters. "
         "summary: one or two short Pashto sentences, maximum 420 characters."
     )
-    payload = {
-        "model": CONFIG.get("grok_model") or "grok-4.1-fast",
+    payload: Dict[str, Any] = {
+        "model": model,
         "temperature": 0.2,
-        "max_tokens": 320,
+        "max_tokens": 800,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": context},
         ],
     }
-    try:
-        resp = requests.post(
-            XAI_CHAT_URL,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=40,
-        )
-        if resp.status_code != 200:
-            log.warning("grok API -> HTTP %s; using fallback", resp.status_code)
-            return None
-        data = resp.json()
-        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-    except (requests.RequestException, ValueError, KeyError, IndexError) as exc:
-        log.warning("grok API error: %s; using fallback", exc)
+    if "gpt-oss" in model.lower():
+        # reasoning model: short thinking + pure JSON answer
+        payload["reasoning_effort"] = "low"
+        payload["response_format"] = {"type": "json_object"}
+    for attempt in range(1, 3):
+        try:
+            resp = requests.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=CONFIG["llm_timeout"],
+            )
+        except requests.RequestException as exc:
+            log.warning("llm(%s) network error (attempt %d): %s", model, attempt, exc)
+            time.sleep(2 * attempt)
+            continue
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            except (ValueError, KeyError, IndexError, TypeError) as exc:
+                log.warning("llm(%s) bad response: %s; using fallback", model, exc)
+                return None
+            composed = _parse_llm_reply(str(content))
+            if composed:
+                log.info("llm(%s): composed Pashto post for %s", model, item.category)
+            return composed
+        if resp.status_code == 429 and attempt < 2:
+            try:
+                wait = int(resp.headers.get("retry-after", "")) or 5
+            except ValueError:
+                wait = 5
+            log.warning("llm(%s) rate limited; retrying in %ss", model, wait)
+            time.sleep(max(1, min(wait, 30)))
+            continue
+        log.warning("llm(%s) -> HTTP %s; using fallback", model, resp.status_code)
         return None
-    cleaned = re.sub(r"^```(?:json)?|```$", "", str(content).strip(), flags=re.M).strip()
-    match = re.search(r"\{.*\}", cleaned, re.S)
-    if not match:
-        return None
-    try:
-        parsed = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return None
-    headline = _clean_spaces(str(parsed.get("headline", "")))
-    summary = _clean_spaces(str(parsed.get("summary", "")))
-    if 8 <= len(headline) <= 160 and 30 <= len(summary) <= 700:
-        return headline, summary
-    log.warning("grok output failed validation; using fallback")
+    log.warning("llm(%s) failed after retries; using fallback", model)
     return None
 
 
@@ -1611,10 +1672,9 @@ def render_rotation_post(item: NewsItem) -> str:
     headline = item.title
     body = item.summary
     if item.category in ("economy", "afghan_tech", "jobs", "global_tech", "social"):
-        composed = grok_compose(item)
+        composed = llm_compose(item)
         if composed:
             headline, body = composed
-            log.info("grok: composed Pashto post for %s", item.category)
         else:
             body = _fallback_body(item)
     body = body[:1400]

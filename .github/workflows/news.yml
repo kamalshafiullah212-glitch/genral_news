@@ -1,6 +1,7 @@
 name: General News Bot — Daily Pashto News
 
-# One post per run, rotating through a fixed seven-category cycle.
+# date + rates once a day after 06:00 Asia/Kabul; other news published as soon
+# as it is found, paced to reach at least 15 posts per day.
 # GitHub may delay scheduled workflows by a few minutes.
 on:
   schedule:
@@ -43,6 +44,10 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # LLM writer (preferred: Groq; default model openai/gpt-oss-120b)
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_MODEL: ${{ vars.GROQ_MODEL }}
+          # optional alternative provider: xAI Grok
           GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
           GROK_MODEL: ${{ vars.GROK_MODEL }}
           MAX_POSTS_PER_RUN: "1"

@@ -45,17 +45,29 @@ Every post includes the category, a short Pashto text, `📅 نېټه`, `🔗 س
 the original link, and category hashtags. Numbers, currencies and dates are
 copied from the source and are never invented.
 
-## Grok writing (news categories)
+## Pashto writing with an LLM (Groq by default)
 
 For `economy`, `afghan_tech`, `jobs`, `global_tech` and `social`, the bot asks
-Grok to turn the supplied title/summary into a short natural Pashto post. The
-API call uses only the supplied facts and numbers. **If `GROK_API_KEY` is absent
-or the call fails, a safe built-in summary is posted instead** so the daily
-15-post target is not lost. `date` and `rates` are never rewritten — their
-numbers come straight from the source.
+an LLM to turn the supplied title/summary into a short natural Pashto post. The
+request carries only the supplied facts and numbers. **If no API key is set, or
+the call fails / is rate-limited, a safe built-in summary is posted instead** so
+the daily 15-post target is not lost. `date` and `rates` are never rewritten —
+their numbers come straight from the source.
 
-`GROK_MODEL` can be set as a repository **variable** (Settings → Secrets and
-variables → Actions → Variables). Default when empty: `grok-4.1-fast`.
+| Provider | Secret / variable | Endpoint | Default model |
+|---|---|---|---|
+| **Groq** (preferred) | `GROQ_API_KEY` / `GROQ_MODEL` | `api.groq.com/openai/v1/chat/completions` | **`openai/gpt-oss-120b`** |
+| xAI Grok (optional) | `GROK_API_KEY` / `GROK_MODEL` | `api.x.ai/v1/chat/completions` | `grok-4.1-fast` |
+
+* The model must be a **valid provider model id**. On Groq the OpenAI
+  open-weight model is `openai/gpt-oss-120b` — write it exactly; `gpt-oos-120b`
+  or `gpt_oos_120b` is rejected (HTTP 404 model_not_found) and the bot silently
+  falls back to its built-in Pashto summary.
+* Groq wins when both keys exist. `LLM_MODEL` overrides the model for whichever
+  provider is used, and `LLM_BASE_URL` can point at any OpenAI-compatible
+  `/chat/completions` endpoint.
+* For `gpt-oss` models the bot also sends `reasoning_effort: low` and JSON mode,
+  so a short structured Pashto answer comes back fast.
 
 ## Setup
 
@@ -63,7 +75,8 @@ variables → Actions → Variables). Default when empty: `grok-4.1-fast`.
 2. **Settings → Secrets and variables → Actions → New repository secret**:
    * `TELEGRAM_BOT_TOKEN` — from @BotFather
    * `TELEGRAM_CHAT_ID` — target chat/channel id (digits only, from @userinfobot)
-   * `GROK_API_KEY` — optional, for AI-written Pashto wording
+   * `GROQ_API_KEY` — Groq key from console.groq.com (recommended writer)
+   * `GROK_API_KEY` — optional xAI key (only if you prefer Grok models)
 3. Open the **Actions** tab, select *General News Bot — Daily Pashto News*,
    and click **Run workflow** once to verify.
 
@@ -96,8 +109,13 @@ Environment variables:
 | `MAX_AGE_HOURS` | Ignore older news items in normal mode (workflow uses 36) |
 | `MIN_SCORE` | Minimum relevance score for RSS candidates |
 | `STATE_FILE` | Persisted rotation/duplicate state path |
-| `GROK_API_KEY` | Optional xAI key used only for Pashto wording |
-| `GROK_MODEL` | Optional model name; defaults to `grok-4.1-fast` |
+| `GROQ_API_KEY` | Groq key for Pashto writing (preferred) |
+| `GROQ_MODEL` | Groq model id; defaults to `openai/gpt-oss-120b` |
+| `GROK_API_KEY` | Optional xAI key (alternative writer) |
+| `GROK_MODEL` | xAI model name; defaults to `grok-4.1-fast` |
+| `LLM_MODEL` | Overrides the model for whichever provider is used |
+| `LLM_BASE_URL` | Any OpenAI-compatible base URL / `chat/completions` |
+| `LLM_TIMEOUT` | Seconds to wait for the LLM answer (default `60`) |
 
 > GitHub cron is UTC, so 06:00 Kabul is `01:30 UTC` (`cron: "*/30 * * * *"`
 > already covers it). GitHub may delay a scheduled run by a few minutes; the bot
